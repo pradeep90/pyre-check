@@ -64,6 +64,7 @@ module DiamondOrder = struct
     | left, right when always_less_or_equal () ~left ~right -> right
     | right, left when always_less_or_equal () ~left ~right -> right
     | Type.Primitive "left_parent", Type.Primitive "right_parent" -> Type.Primitive "Grandparent"
+    | Type.Tuple _, Type.Tuple _ -> Type.union [left; right]
     | _ -> Type.Top
 end
 
@@ -80,6 +81,12 @@ let add_bound constraints bound =
   | `Upper pair -> DiamondOrderedConstraints.add_upper_bound constraints ~order ~pair
   | `Fallback variable ->
       DiamondOrderedConstraints.add_fallback_to_any constraints variable |> Option.some
+  | `VariadicTupleConstraint (left_elements, right_elements) ->
+      DiamondOrderedConstraints.add_variadic_tuple_constraint
+        constraints
+        ~order
+        ~left_elements
+        ~right_elements
 
 
 let test_add_bound _ =
@@ -623,6 +630,86 @@ let test_partial_solution _ =
   ()
 
 
+let test_variadic_tuple_solution _ =
+  let variadic_tuple_a = variable ~name:"Ts_a" Type.Variable.Unconstrained in
+  let variadic_tuple_b = variable ~name:"Ts_b" Type.Variable.Unconstrained in
+  assert_solution
+    ~sequentially_applied_bounds:
+      [
+        `VariadicTupleConstraint
+          ( [Type.integer; Type.string; Type.integer; Type.bool],
+            [
+              Type.integer;
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_a)];
+              Type.bool;
+            ] );
+      ]
+    (Some [UnaryPair (variadic_tuple_a, Type.tuple [Type.string; Type.integer])]);
+  assert_solution
+    ~sequentially_applied_bounds:
+      [
+        `VariadicTupleConstraint
+          ( [Type.integer],
+            [
+              Type.integer;
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_a)];
+              Type.bool;
+            ] );
+      ]
+    None;
+  assert_solution
+    ~sequentially_applied_bounds:
+      [
+        `VariadicTupleConstraint
+          ( [Type.integer; Type.string; Type.bool],
+            [
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_a)];
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_b)];
+            ] );
+        `Lower (UnaryPair (variadic_tuple_a, Type.tuple [Type.integer; Type.string]));
+      ]
+    (Some
+       [
+         UnaryPair (variadic_tuple_a, Type.tuple [Type.integer; Type.string]);
+         UnaryPair (variadic_tuple_b, Type.tuple [Type.bool]);
+       ]);
+  assert_solution
+    ~sequentially_applied_bounds:
+      [
+        `VariadicTupleConstraint
+          ( [Type.integer; Type.string; Type.bool],
+            [
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_a)];
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_b)];
+            ] );
+        `Lower (UnaryPair (variadic_tuple_a, Type.tuple [Type.integer; Type.bool]));
+      ]
+    (Some
+       [
+         UnaryPair
+           ( variadic_tuple_a,
+             Type.union
+               [Type.tuple [Type.integer; Type.bool]; Type.tuple [Type.integer; Type.string]] );
+         UnaryPair (variadic_tuple_b, Type.tuple [Type.bool]);
+       ]);
+  assert_solution
+    ~sequentially_applied_bounds:
+      [
+        `VariadicTupleConstraint
+          ( [Type.integer; Type.string; Type.bool],
+            [
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_a)];
+              Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable variadic_tuple_b)];
+            ] );
+        `Lower
+          (UnaryPair
+             ( variadic_tuple_a,
+               Type.tuple [Type.integer; Type.string; Type.bool; Type.bool; Type.bool] ));
+      ]
+    None;
+  ()
+
+
 let test_exists _ =
   let order = () in
   let unconstrained_a = variable ~name:"A" Type.Variable.Unconstrained in
@@ -689,6 +776,7 @@ let () =
          "add_bound" >:: test_add_bound;
          "single_variable" >:: test_single_variable_solution;
          "multiple_variables" >:: test_multiple_variable_solution;
+         "variadic_tuple_solution" >:: test_variadic_tuple_solution;
          "partial_solution" >:: test_partial_solution;
          "exists" >:: test_exists;
        ]

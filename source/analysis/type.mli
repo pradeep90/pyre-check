@@ -435,6 +435,10 @@ end
 
 val exists : t -> predicate:(t -> bool) -> bool
 
+module TupleVariadic : sig
+  val create_unpacked_tuple : type_t list -> type_t
+end
+
 module Callable : sig
   module Parameter : sig
     include module type of struct

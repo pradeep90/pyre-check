@@ -163,6 +163,41 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
           >>| add_bound
           >>| List.concat_map ~f:continue
           |> Option.value ~default:[]
+        and solve_parameters_against_tuple_variadic ~is_lower_bound ~concretes ~variadic_elements =
+          let before_first_keyword =
+            let is_not_keyword_only = function
+              | Type.Callable.Parameter.Keywords _
+              | Type.Callable.Parameter.KeywordOnly _ ->
+                  false
+              | _ -> true
+            in
+            List.take_while concretes ~f:is_not_keyword_only
+          in
+          let extract_annotation_for_named_or_positional = function
+            | Type.Callable.Parameter.PositionalOnly { annotation; _ } -> Some annotation
+            | Named { annotation; _ } when is_lower_bound ->
+                (* Named arguments can be called positionally, but positionals can't be called with
+                   a name *)
+                Some annotation
+            | _ -> None
+          in
+          let add_bound concrete_elements =
+            let left_elements, right_elements =
+              if is_lower_bound then
+                concrete_elements, variadic_elements
+              else
+                variadic_elements, concrete_elements
+            in
+            solve_concrete_tuples
+              order
+              ~left_annotations:left_elements
+              ~right_annotations:right_elements
+              ~constraints
+          in
+          List.map before_first_keyword ~f:extract_annotation_for_named_or_positional
+          |> Option.all
+          >>| add_bound
+          |> Option.value ~default:impossible
         and solve_parameters ~left_parameters ~right_parameters constraints =
           match left_parameters, right_parameters with
           | Parameter.PositionalOnly _ :: _, Parameter.Named _ :: _ -> []
@@ -172,6 +207,34 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
               Parameter.PositionalOnly { annotation = right_annotation; _ } :: right_parameters ) ->
               solve_less_or_equal order ~constraints ~left:right_annotation ~right:left_annotation
               |> List.concat_map ~f:(solve_parameters ~left_parameters ~right_parameters)
+          | ( left,
+              [
+                Parameter.Variable
+                  (Concrete
+                    (Type.Parametric
+                      {
+                        name = "pyre_extensions.Unpack";
+                        parameters = [Single (Type.Tuple (Bounded (Concrete variadic_elements)))];
+                      }));
+              ] ) ->
+              solve_parameters_against_tuple_variadic
+                ~is_lower_bound:true
+                ~concretes:left
+                ~variadic_elements
+          | ( [
+                Parameter.Variable
+                  (Concrete
+                    (Type.Parametric
+                      {
+                        name = "pyre_extensions.Unpack";
+                        parameters = [Single (Type.Tuple (Bounded (Concrete variadic_elements)))];
+                      }));
+              ],
+              right ) ->
+              solve_parameters_against_tuple_variadic
+                ~is_lower_bound:false
+                ~concretes:right
+                ~variadic_elements
           | ( Parameter.Variable (Concrete left_annotation) :: left_parameters,
               Parameter.Variable (Concrete right_annotation) :: right_parameters )
           | ( Parameter.Keywords left_annotation :: left_parameters,
@@ -584,6 +647,40 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
           | _ -> impossible
         in
         List.append through_protocol_hierarchy through_meta_hierarchy
+    | ( Type.Tuple (Type.Bounded (Concrete tuple_elements)),
+        Type.Parametric
+          {
+            name = "pyre_extensions.Map";
+            parameters =
+              [
+                Single (Type.Parametric { name = mapper_name; parameters = _ });
+                Single mapped_annotation;
+              ];
+          } ) ->
+        solve_map_against_concrete_tuple
+          order
+          ~constraints
+          ~tuple_elements
+          ~mapper_name
+          ~mapped_annotation
+          ~is_map_upper_bound:true
+    | ( Type.Parametric
+          {
+            name = "pyre_extensions.Map";
+            parameters =
+              [
+                Single (Type.Parametric { name = mapper_name; parameters = _ });
+                Single mapped_annotation;
+              ];
+          },
+        Type.Tuple (Type.Bounded (Concrete tuple_elements)) ) ->
+        solve_map_against_concrete_tuple
+          order
+          ~constraints
+          ~tuple_elements
+          ~mapper_name
+          ~mapped_annotation
+          ~is_map_upper_bound:false
     | _, Type.Parametric { name = right_name; parameters = right_parameters } ->
         let solve_parameters left_parameters =
           let handle_variables constraints (left, right, variable) =
@@ -685,6 +782,9 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
     | Type.Tuple (Type.Bounded lefts), Type.Tuple (Type.Unbounded right) ->
         let left = Type.OrderedTypes.union_upper_bound lefts in
         solve_less_or_equal order ~constraints ~left ~right
+    | ( Type.Tuple (Type.Bounded (Concrete left_annotations)),
+        Type.Tuple (Type.Bounded (Concrete right_annotations)) ) ->
+        solve_concrete_tuples order ~left_annotations ~right_annotations ~constraints
     | Type.Tuple (Type.Bounded left), Type.Tuple (Type.Bounded right) ->
         solve_ordered_types_less_or_equal order ~left ~right ~constraints
     | Type.Tuple (Type.Unbounded parameter), Type.Primitive _ ->
@@ -915,6 +1015,102 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
               ~pair:(Type.Variable.ListVariadicPair (variable, Concatenation left))
             |> Option.to_list
         | _ -> impossible )
+
+
+  and solve_concrete_tuples order ~left_annotations ~right_annotations ~constraints =
+    let is_expanded_variable index = function
+      | Type.Parametric
+          { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Variable variable)] } ->
+          Some (index, variable, Type.Variable.Unary.is_free variable)
+      | _ -> None
+    in
+    match
+      ( List.filter_mapi ~f:is_expanded_variable left_annotations,
+        List.filter_mapi ~f:is_expanded_variable right_annotations )
+    with
+    | [(free_variable_index, free_variable, true)], bound_variables
+      when List.for_all bound_variables ~f:(fun (_, _, is_free) -> not is_free) ->
+        let non_variadic_prefix_length = free_variable_index in
+        let non_variadic_suffix_length = List.length left_annotations - free_variable_index - 1 in
+        let middle_portion_length =
+          List.length right_annotations - (non_variadic_prefix_length + non_variadic_suffix_length)
+        in
+        let right_prefix, right_rest = List.split_n right_annotations non_variadic_prefix_length in
+        let right_middle_portion, right_suffix = List.split_n right_rest middle_portion_length in
+        let right_middle_portion =
+          match right_middle_portion with
+          | [
+           Type.Parametric
+             { name = "pyre_extensions.Unpack"; parameters = [Single (Variable variable)] };
+          ] ->
+              Type.Variable variable
+          | _ -> Type.tuple right_middle_portion
+        in
+        let left_prefix, left_rest = List.split_n left_annotations non_variadic_prefix_length in
+        let left_suffix = List.tl_exn left_rest in
+        solve_less_or_equal
+          order
+          ~constraints
+          ~left:(Type.tuple left_prefix)
+          ~right:(Type.tuple right_prefix)
+        |> List.concat_map ~f:(fun constraints ->
+               solve_less_or_equal
+                 order
+                 ~constraints
+                 ~left:(Type.Variable free_variable)
+                 ~right:right_middle_portion)
+        |> List.concat_map ~f:(fun constraints ->
+               solve_less_or_equal
+                 order
+                 ~constraints
+                 ~left:(Type.tuple left_suffix)
+                 ~right:(Type.tuple right_suffix))
+    | bound_variables, _ :: _
+      when List.for_all bound_variables ~f:(fun (_, _, is_free) -> not is_free) ->
+        OrderedConstraints.add_variadic_tuple_constraint
+          constraints
+          ~order
+          ~left_elements:left_annotations
+          ~right_elements:right_annotations
+        |> Option.to_list
+    | _ ->
+        solve_ordered_types_less_or_equal
+          order
+          ~left:(Concrete left_annotations)
+          ~right:(Concrete right_annotations)
+          ~constraints
+
+
+  and solve_map_against_concrete_tuple
+      order
+      ~constraints
+      ~tuple_elements
+      ~mapper_name
+      ~mapped_annotation
+      ~is_map_upper_bound
+    =
+    let unmap_annotation = function
+      | Type.Parametric { name; parameters = [Single annotation] }
+        when Identifier.equal name mapper_name ->
+          Some annotation
+      | _ -> None
+    in
+    List.map ~f:unmap_annotation tuple_elements
+    |> Option.all
+    >>| (fun tuple_elements ->
+          if is_map_upper_bound then
+            solve_less_or_equal
+              order
+              ~constraints
+              ~left:(Type.tuple tuple_elements)
+              ~right:mapped_annotation
+          else
+            solve_less_or_equal
+              order
+              ~constraints
+              ~left:mapped_annotation
+              ~right:(Type.tuple tuple_elements))
+    |> Option.value ~default:impossible
 
 
   (* Find parameters to instantiate `protocol` such that `candidate <: protocol[parameters]`, where

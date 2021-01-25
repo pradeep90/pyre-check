@@ -35,8 +35,25 @@ type list_variadic_interval =
     }
 [@@deriving show]
 
+module Record = struct
+  module VariadicTupleConstraints = struct
+    type variadic_constraint_pair = {
+      left_elements: Type.t list;
+      right_elements: Type.t list;
+    }
+    [@@deriving show, compare]
+
+    (* Going with a simple list of pairs for now. We can optimize this to be a map from Ts to the
+       constraints containing it. *)
+    type t = variadic_constraint_pair list [@@deriving show, compare]
+
+    let empty = []
+  end
+end
+
 type t = {
   unaries: unary_interval UnaryVariable.Map.t;
+  variadic_tuple_constraints: Record.VariadicTupleConstraints.t;
   callable_parameters: callable_parameter_interval ParameterVariable.Map.t;
   list_variadics: list_variadic_interval ListVariadic.Map.t;
   have_fallbacks: Type.Variable.Set.t;
@@ -52,7 +69,10 @@ let show_map map ~show_key ~show_data ~short_name =
     Map.fold map ~init:[] ~f:show |> String.concat ~sep:"\n" |> Format.sprintf "%s: [%s]" short_name
 
 
-let pp format { unaries; callable_parameters; list_variadics; have_fallbacks } =
+let pp
+    format
+    { unaries; variadic_tuple_constraints; callable_parameters; list_variadics; have_fallbacks }
+  =
   let unaries =
     show_map unaries ~show_key:UnaryVariable.show ~show_data:show_unary_interval ~short_name:"un"
   in
@@ -75,7 +95,14 @@ let pp format { unaries; callable_parameters; list_variadics; have_fallbacks } =
     |> List.to_string ~f:Type.Variable.show
     |> Format.sprintf "\nHave Fallbacks to Any: %s"
   in
-  Format.fprintf format "{%s%s%s%s}" unaries callable_parameters list_variadics have_fallbacks
+  Format.fprintf
+    format
+    "{%s\n%s\n%s%s%s}"
+    unaries
+    ([%show: Record.VariadicTupleConstraints.t] variadic_tuple_constraints)
+    callable_parameters
+    list_variadics
+    have_fallbacks
 
 
 let show annotation = Format.asprintf "%a" pp annotation
@@ -83,6 +110,7 @@ let show annotation = Format.asprintf "%a" pp annotation
 let empty =
   {
     unaries = UnaryVariable.Map.empty;
+    variadic_tuple_constraints = Record.VariadicTupleConstraints.empty;
     callable_parameters = ParameterVariable.Map.empty;
     list_variadics = ListVariadic.Map.empty;
     have_fallbacks = Type.Variable.Set.empty;
@@ -274,6 +302,13 @@ module type OrderedConstraintsType = sig
 
   val add_upper_bound : t -> order:order -> pair:Type.Variable.pair -> t option
 
+  val add_variadic_tuple_constraint
+    :  t ->
+    order:order ->
+    left_elements:Type.t list ->
+    right_elements:Type.t list ->
+    t option
+
   val add_fallback_to_any : t -> Type.Variable.t -> t
 
   val solve : t -> order:order -> Solution.t option
@@ -348,7 +383,7 @@ module OrderedConstraints (Order : OrderType) = struct
 
 
       let partition_independent_dependent container ~with_regards_to =
-        let contains_key { unaries; callable_parameters; list_variadics; have_fallbacks } key =
+        let contains_key { unaries; callable_parameters; list_variadics; have_fallbacks; _ } key =
           let has_constraints =
             match key with
             | Type.Variable.Unary unary -> Map.mem unaries unary
@@ -701,6 +736,210 @@ module OrderedConstraints (Order : OrderType) = struct
   module UnaryIntervalContainer = IntervalContainer.Make (UnaryTypeInterval)
   module ListVariadicIntervalContainer = IntervalContainer.Make (ListVariadicInterval)
 
+  module VariadicTupleConstraints = struct
+    include Record.VariadicTupleConstraints
+
+    let instantiate variadic_tuple_constraints ~solution =
+      let instantiate_variadic_constraint_pair { left_elements; right_elements } =
+        {
+          left_elements = List.map left_elements ~f:(Solution.instantiate solution);
+          right_elements = List.map right_elements ~f:(Solution.instantiate solution);
+        }
+      in
+      List.map variadic_tuple_constraints ~f:instantiate_variadic_constraint_pair
+
+
+    let known_length_for ~unaries annotation =
+      match annotation with
+      | Type.Parametric
+          { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Variable variable)] }
+        when Type.Variable.Unary.is_free variable ->
+          let tuple_type_length annotation =
+            match annotation with
+            | Type.Tuple (Bounded (Concrete annotations))
+              when List.is_empty (Type.Variable.all_free_variables annotation) ->
+                Some (List.length annotations)
+            | _ -> None
+          in
+          UnaryVariable.Map.find unaries variable
+          >>= fun { lower_bound; upper_bound } ->
+          Option.first_some (tuple_type_length lower_bound) (tuple_type_length upper_bound)
+      | _ -> Some 1
+
+
+    let strip_elements_of_known_length
+        ({ unaries; _ } as constraints)
+        ~order
+        { left_elements; right_elements }
+      =
+      let has_free_variable =
+        Type.exists ~predicate:(function
+            | Type.Variable variable when Type.Variable.Unary.is_free variable -> true
+            | _ -> false)
+      in
+      match
+        ( List.exists left_elements ~f:has_free_variable,
+          List.exists right_elements ~f:has_free_variable )
+      with
+      | false, true ->
+          let pair_with_matching_left_elements (pairs, left_elements, should_continue) right_element
+            =
+            match known_length_for ~unaries right_element with
+            | Some length when should_continue ->
+                let left_prefix, left_rest = List.split_n left_elements length in
+                if List.length left_prefix = length then
+                  (Some left_prefix, right_element) :: pairs, left_rest, true
+                else
+                  (None, right_element) :: pairs, left_rest, false
+            | _ -> pairs, left_elements, false
+          in
+          let pairs_for_right_prefix, remaining_left_elements, _ =
+            List.fold
+              right_elements
+              ~init:([], left_elements, true)
+              ~f:pair_with_matching_left_elements
+          in
+          let remaining_right_elements =
+            List.drop right_elements (List.length pairs_for_right_prefix)
+          in
+          let pairs_for_right_suffix, remaining_left_elements, _ =
+            List.fold
+              (List.rev remaining_right_elements)
+              ~init:([], List.rev remaining_left_elements, true)
+              ~f:pair_with_matching_left_elements
+          in
+          let left_middle_portion = List.rev remaining_left_elements in
+          let right_middle_portion =
+            List.take
+              remaining_right_elements
+              (List.length remaining_right_elements - List.length pairs_for_right_suffix)
+          in
+          let add_bound_for_pair unaries (left_elements, right) =
+            unaries
+            >>= fun unaries ->
+            match left_elements, right with
+            | Some [left], Type.Variable right when Type.Variable.Unary.is_free right ->
+                UnaryIntervalContainer.add_bound
+                  ~order
+                  ~variable:right
+                  ~bound:left
+                  ~is_lower_bound:true
+                  unaries
+            | ( Some left_elements,
+                Type.Parametric
+                  {
+                    name = "pyre_extensions.Unpack";
+                    parameters = [Single (Type.Variable variable)];
+                  } )
+              when Type.Variable.Unary.is_free variable ->
+                UnaryIntervalContainer.add_bound
+                  ~order
+                  ~variable
+                  ~bound:(Type.tuple left_elements)
+                  ~is_lower_bound:true
+                  unaries
+            | Some [left], right ->
+                Option.some_if (Order.always_less_or_equal order ~left ~right) unaries
+            | _ -> None
+          in
+          let unaries_after_adding_bounds =
+            List.fold
+              (pairs_for_right_prefix @ pairs_for_right_suffix)
+              ~init:(Some unaries)
+              ~f:add_bound_for_pair
+          in
+          let add_new_variadic_constraint
+              ({ unaries; _ } as constraints)
+              { left_elements; right_elements }
+            =
+            match left_elements, right_elements with
+            | ( _,
+                [
+                  Type.Parametric
+                    {
+                      name = "pyre_extensions.Unpack";
+                      parameters = [Single (Type.Variable variable)];
+                    };
+                ] ) ->
+                UnaryIntervalContainer.add_bound
+                  ~order
+                  ~variable
+                  ~bound:(Type.tuple left_elements)
+                  ~is_lower_bound:true
+                  unaries
+                >>| fun unaries -> { constraints with unaries }, None
+            | _ ->
+                Some
+                  ( constraints,
+                    Option.some_if
+                      (not (List.is_empty left_elements && List.is_empty right_elements))
+                      { left_elements; right_elements } )
+          in
+          let constraints_after_adding_unary_bounds =
+            unaries_after_adding_bounds >>| fun unaries -> { constraints with unaries }
+          in
+          constraints_after_adding_unary_bounds
+          >>= fun constraints ->
+          add_new_variadic_constraint
+            constraints
+            { left_elements = left_middle_portion; right_elements = right_middle_portion }
+      | _ -> None
+
+
+    let add ({ unaries; _ } as constraints) ~order ~left_elements ~right_elements =
+      let free_unaries annotation =
+        Type.Variable.all_free_variables annotation
+        |> List.filter_map ~f:(function
+               | Type.Variable.Unary unary -> Some unary
+               | _ -> None)
+      in
+      let all_free_unaries = List.concat_map ~f:free_unaries (left_elements @ right_elements) in
+      let add_unary_to_container unaries unary =
+        (* We merely want to include `unary` in the set of unaries. So, just add a trivial interval. *)
+        unaries
+        >>= UnaryIntervalContainer.add_bound
+              ~order
+              ~variable:unary
+              ~bound:Type.Bottom
+              ~is_lower_bound:true
+      in
+      List.fold all_free_unaries ~init:(Some unaries) ~f:add_unary_to_container
+      >>= fun unaries ->
+      strip_elements_of_known_length
+        { constraints with unaries }
+        ~order
+        { left_elements; right_elements }
+      >>| fun (constraints, new_variadic_constraint) ->
+      match new_variadic_constraint with
+      | Some new_variadic_constraint ->
+          {
+            constraints with
+            variadic_tuple_constraints =
+              new_variadic_constraint :: constraints.variadic_tuple_constraints;
+          }
+      | None -> constraints
+
+
+    let update_on_unary ({ variadic_tuple_constraints; _ } as constraints) ~order ~variable =
+      (order, variable, variadic_tuple_constraints) |> ignore;
+      let simplify_variadic_constraint state variadic_constraint =
+        state
+        >>= fun (constraints, variadic_constraints) ->
+        strip_elements_of_known_length ~order constraints variadic_constraint
+        >>| fun (constraints, simplified_variadic_constraint) ->
+        match simplified_variadic_constraint with
+        | Some simplified_variadic_constraint ->
+            constraints, simplified_variadic_constraint :: variadic_constraints
+        | None -> constraints, variadic_constraints
+      in
+      List.fold
+        variadic_tuple_constraints
+        ~init:(Some (constraints, []))
+        ~f:simplify_variadic_constraint
+      >>| fun (constraints, variadic_tuple_constraints) ->
+      { constraints with variadic_tuple_constraints }
+  end
+
   type order = Order.t
 
   let add_bound
@@ -712,7 +951,8 @@ module OrderedConstraints (Order : OrderType) = struct
     match pair with
     | Type.Variable.UnaryPair (variable, bound) ->
         UnaryIntervalContainer.add_bound unaries ~order ~variable ~bound ~is_lower_bound
-        >>| fun unaries -> { constraints with unaries }
+        >>| (fun unaries -> { constraints with unaries })
+        >>= VariadicTupleConstraints.update_on_unary ~order ~variable
     | Type.Variable.ParameterVariadicPair (variable, bound) ->
         CallableParametersIntervalContainer.add_bound
           callable_parameters
@@ -735,13 +975,22 @@ module OrderedConstraints (Order : OrderType) = struct
 
   let add_upper_bound = add_bound ~is_lower_bound:false
 
+  let add_variadic_tuple_constraint constraints ~order ~left_elements ~right_elements =
+    VariadicTupleConstraints.add constraints ~order ~left_elements ~right_elements
+
+
   let add_fallback_to_any ({ have_fallbacks; _ } as constraints) addition =
     { constraints with have_fallbacks = Set.add have_fallbacks addition }
 
 
-  let merge_solution { unaries; callable_parameters; list_variadics; have_fallbacks } solution =
+  let merge_solution
+      { unaries; variadic_tuple_constraints; callable_parameters; list_variadics; have_fallbacks }
+      solution
+    =
     {
       unaries = UnaryIntervalContainer.merge_solution unaries ~solution;
+      variadic_tuple_constraints =
+        VariadicTupleConstraints.instantiate variadic_tuple_constraints ~solution;
       callable_parameters =
         CallableParametersIntervalContainer.merge_solution callable_parameters ~solution;
       list_variadics = ListVariadicIntervalContainer.merge_solution list_variadics ~solution;
@@ -801,19 +1050,21 @@ module OrderedConstraints (Order : OrderType) = struct
         in
         ( {
             unaries = independent_unaries;
+            variadic_tuple_constraints = remaining_constraints.variadic_tuple_constraints;
             callable_parameters = independent_parameters;
             list_variadics = independent_list_variadics;
             have_fallbacks = independent_fallbacks;
           },
           {
             unaries = dependent_unaries;
+            variadic_tuple_constraints = remaining_constraints.variadic_tuple_constraints;
             callable_parameters = dependent_parameters;
             list_variadics = dependent_list_variadics;
             have_fallbacks = dependent_fallbacks;
           } )
       in
       let handle_dependent_constraints partial_solution =
-        let is_empty { unaries; callable_parameters; list_variadics; have_fallbacks } =
+        let is_empty { unaries; callable_parameters; list_variadics; have_fallbacks; _ } =
           UnaryVariable.Map.is_empty unaries
           && ParameterVariable.Map.is_empty callable_parameters
           && ListVariadic.Map.is_empty list_variadics
@@ -839,7 +1090,7 @@ module OrderedConstraints (Order : OrderType) = struct
 
 
   let extract_partial_solution
-      { unaries; callable_parameters; list_variadics; have_fallbacks }
+      { unaries; variadic_tuple_constraints; callable_parameters; list_variadics; have_fallbacks }
       ~order
       ~variables
     =
@@ -872,12 +1123,14 @@ module OrderedConstraints (Order : OrderType) = struct
       in
       ( {
           unaries = extracted_unaries;
+          variadic_tuple_constraints;
           callable_parameters = extracted_variadics;
           list_variadics = extracted_list_variadics;
           have_fallbacks = extracted_fallbacks;
         },
         {
           unaries = remaining_unaries;
+          variadic_tuple_constraints;
           callable_parameters = remaining_variadics;
           list_variadics = remaining_list_variadics;
           have_fallbacks = remaining_fallbacks;

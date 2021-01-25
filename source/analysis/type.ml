@@ -1348,7 +1348,10 @@ let rec pp format annotation =
   | NoneType -> Format.fprintf format "None"
   | Parametric { name; parameters } ->
       let name = reverse_substitute name in
-      Format.fprintf format "%s[%a]" name (pp_parameters ~pp_type:pp) parameters
+      if Identifier.equal name "pyre_extensions.Unpack" then
+        Format.fprintf format "*%a" (pp_parameters ~pp_type:pp) parameters
+      else
+        Format.fprintf format "%s[%a]" name (pp_parameters ~pp_type:pp) parameters
   | ParameterVariadicComponent component ->
       Record.Variable.RecordVariadic.RecordParameters.RecordComponents.pp_concise format component
   | Primitive name -> Format.fprintf format "%a" String.pp name
@@ -2117,6 +2120,64 @@ let instantiate ?(widen = false) ?(visit_children_before = false) annotation ~co
   snd (InstantiateTransform.visit () annotation)
 
 
+let is_variable = function
+  | Variable _ -> true
+  | _ -> false
+
+
+let contains_variable = exists ~predicate:is_variable
+
+module TupleVariadic = struct
+  let normalize_variadics =
+    let open Core in
+    instantiate ~constraints:(function
+        | Parametric
+            {
+              name = "pyre_extensions.Map";
+              parameters =
+                [
+                  Single (Parametric { name = mapper_name; _ });
+                  Single (Tuple (Bounded (Concrete annotations)));
+                ];
+            }
+          when not (List.exists ~f:contains_variable annotations) ->
+            Some
+              (Tuple
+                 (Bounded
+                    (Concrete
+                       (List.map annotations ~f:(fun annotation ->
+                            Parametric { name = mapper_name; parameters = [Single annotation] })))))
+        | Tuple
+            (Bounded
+              (Concrete
+                [
+                  Parametric
+                    {
+                      name = "pyre_extensions.Unpack";
+                      parameters = [Single (Tuple (Bounded (Concrete [(Variable _ as variable)])))];
+                    };
+                ])) ->
+            Some variable
+        | Tuple (Bounded (Concrete annotations)) ->
+            let unpack_expand = function
+              | Parametric
+                  {
+                    name = "pyre_extensions.Unpack";
+                    parameters = [Single (Tuple (Bounded (Concrete annotations)))];
+                  } ->
+                  annotations
+              | annotation -> [annotation]
+            in
+            Some (Tuple (Bounded (Concrete (List.concat_map ~f:unpack_expand annotations))))
+        | _ -> None)
+
+
+  let create_unpacked_tuple = function
+    | [(Variable _ as variable)] -> parametric "pyre_extensions.Unpack" [Single variable]
+    | elements ->
+        parametric "pyre_extensions.Unpack" [Single (tuple elements)] |> normalize_variadics
+end
+
 let contains_callable annotation = exists annotation ~predicate:is_callable
 
 let contains_any annotation = exists annotation ~predicate:is_any
@@ -2798,6 +2859,34 @@ let rec create_logic ~aliases ~variable_aliases { Node.value = expression; _ } =
                         | _ -> undefined ) ) ) )
         | _ -> undefined
       in
+      let collect_as_unpacked_tuple_if_needed signature =
+        let has_unpacked_variable_for_positional_parameter implementation =
+          List.exists implementation ~f:(function
+              | CallableParameter.PositionalOnly
+                  { annotation = Parametric { name = "pyre_extensions.Unpack"; _ }; _ } ->
+                  true
+              | _ -> false)
+        in
+        match signature with
+        | { parameters = Defined parameters; _ }
+          when has_unpacked_variable_for_positional_parameter parameters ->
+            let parameters =
+              List.map parameters ~f:Callable.RecordParameter.annotation
+              |> Option.all
+              >>| (function
+                    | annotations ->
+                        [
+                          CallableParameter.Variable
+                            (Concrete (TupleVariadic.create_unpacked_tuple annotations));
+                        ])
+              |> Option.value ~default:parameters
+            in
+            { signature with parameters = Defined parameters }
+        | _ -> signature
+      in
+      let get_signature expression =
+        get_signature expression |> collect_as_unpacked_tuple_if_needed
+      in
       let implementation =
         match implementation_signature with
         | Some signature -> get_signature (Node.value signature)
@@ -3236,13 +3325,6 @@ let is_untyped = function
 
 
 let is_partially_typed annotation = exists annotation ~predicate:is_untyped
-
-let is_variable = function
-  | Variable _ -> true
-  | _ -> false
-
-
-let contains_variable = exists ~predicate:is_variable
 
 let optional_value = function
   | Union [NoneType; annotation]
@@ -4332,11 +4414,13 @@ end = struct
     module Make (Variable : VariableKind) = struct
       include Variable
 
-      let replace_all operation =
+      let replace_all operation annotation =
         instantiate
           ~visit_children_before:true
           ~constraints:(Variable.local_replace operation)
           ~widen:false
+          annotation
+        |> TupleVariadic.normalize_variadics
 
 
       let map operation =

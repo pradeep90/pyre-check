@@ -125,6 +125,10 @@ let make_assert_functions context =
 
       class HasMeta(metaclass=Meta):
         pass
+
+      Ts_tuple = typing.TypeVar("Ts_tuple")
+      Ts_tuple2 = typing.TypeVar("Ts_tuple2")
+      Ts_tuple3 = typing.TypeVar("Ts_tuple3")
     |}
       context
   in
@@ -161,6 +165,9 @@ let make_assert_functions context =
           "UserDefinedVariadic";
           "UserDefinedVariadicSimpleChild";
           "UserDefinedVariadicMapChild";
+          "Ts_tuple";
+          "Ts_tuple2";
+          "Ts_tuple3";
         ]
         |> Type.Primitive.Set.of_list
       in
@@ -1001,6 +1008,121 @@ let test_add_constraint_recursive_type context =
   ()
 
 
+let test_add_constraint_type_variable_tuple context =
+  let assert_add, assert_add_direct, _, _ = make_assert_functions context in
+  assert_add
+    ~left:"typing.Tuple[int, str, bool]"
+    ~right:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple]]"
+    [["Ts_tuple", "typing.Tuple[str, bool]"]];
+  assert_add
+    ~left:"typing.Tuple[int, str, bool]"
+    ~right:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple], bool]"
+    [["Ts_tuple", "typing.Tuple[str]"]];
+  assert_add
+    ~left:"typing.Tuple[int]"
+    ~right:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple], bool]"
+    [];
+  assert_add
+    ~left:"test.G_invariant[pyre_extensions.Unpack[typing.Tuple[int, str, bool]]]"
+    ~right:
+      "test.G_invariant[pyre_extensions.Unpack[typing.Tuple[int, \
+       pyre_extensions.Unpack[Ts_tuple]]]]"
+    [["Ts_tuple", "typing.Tuple[str, bool]"]];
+  assert_add
+    ~left:"typing.Tuple[int, str, bool]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple2], T]"
+    [["Ts_tuple2", "typing.Tuple[int, str]"; "T", "bool"]];
+  (* We must solve for the variable even for an invariant class. *)
+  assert_add
+    ~leave_unbound_in_left:["Ts_tuple"]
+    ~left:
+      "test.G_invariant[pyre_extensions.Unpack[typing.Tuple[int, \
+       pyre_extensions.Unpack[Ts_tuple]]]]"
+    ~right:"test.G_invariant[pyre_extensions.Unpack[typing.Tuple[int, str, bool]]]"
+    [["Ts_tuple", "typing.Tuple[str, bool]"]];
+  assert_add ~left:"Ts_tuple" ~right:"Ts_tuple2" [["Ts_tuple2", "Ts_tuple"]];
+  assert_add
+    ~left:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple], str]"
+    ~right:"Ts_tuple2"
+    [["Ts_tuple2", "typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple], str]"]];
+  (* The free variadic can be on either side. *)
+  assert_add_direct
+    ~left:
+      (Type.tuple
+         [
+           Type.parametric
+             "pyre_extensions.Unpack"
+             [Single (Type.Variable (Type.Variable.Unary.create "test.Ts_tuple2"))];
+         ])
+    ~right:
+      (Type.tuple
+         [
+           Type.integer;
+           Type.parametric
+             "pyre_extensions.Unpack"
+             [
+               Single
+                 (Type.Variable
+                    (Type.Variable.Unary.create "test.Ts_tuple" |> Type.Variable.Unary.mark_as_bound));
+             ];
+           Type.string;
+         ])
+    [["Ts_tuple2", "typing.Tuple[int, pyre_extensions.Unpack[test.Ts_tuple], str]"]];
+  assert_add
+    ~left:"typing.Tuple[int, int, pyre_extensions.Unpack[Ts_tuple], bool, str]"
+    ~right:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple2], str]"
+    [["Ts_tuple2", "typing.Tuple[int, pyre_extensions.Unpack[test.Ts_tuple], bool]"]];
+  (* Ts_tuple is a bound variadic. It may not be compatible with (int, *Ts_tuple2, str). *)
+  assert_add
+    ~left:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple], str]"
+    ~right:"typing.Tuple[int, int, pyre_extensions.Unpack[Ts_tuple2], str, str]"
+    [];
+  (* Multiple bound variadics. *)
+  assert_add
+    ~left:
+      "typing.Tuple[int, int, pyre_extensions.Unpack[Ts_tuple], bool, \
+       pyre_extensions.Unpack[Ts_tuple2], str, str]"
+    ~right:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple3], str]"
+    [
+      [
+        ( "Ts_tuple3",
+          "typing.Tuple[int, pyre_extensions.Unpack[test.Ts_tuple], bool, \
+           pyre_extensions.Unpack[test.Ts_tuple2], str]" );
+      ];
+    ];
+  assert_add
+    ~left:"typing.Tuple[typing.List[int], typing.List[str]]"
+    ~right:"pyre_extensions.Map[typing.List[typing.Any], Ts_tuple]"
+    [["Ts_tuple", "typing.Tuple[int, str]"]];
+  assert_add
+    ~left:"typing.Tuple[typing.List[int], str]"
+    ~right:"pyre_extensions.Map[typing.List[typing.Any], Ts_tuple]"
+    [];
+  assert_add
+    ~left:"typing.Tuple[typing.List[int], typing.List[bool], typing.List[str]]"
+    ~right:
+      "pyre_extensions.Map[typing.List[typing.Any], typing.Tuple[int, \
+       pyre_extensions.Unpack[Ts_tuple]]]"
+    [["Ts_tuple", "typing.Tuple[bool, str]"]];
+  assert_add
+    ~leave_unbound_in_left:["Ts_tuple"]
+    ~left:
+      "pyre_extensions.Map[typing.List[typing.Any], typing.Tuple[int, \
+       pyre_extensions.Unpack[Ts_tuple]]]"
+    ~right:"typing.Tuple[typing.List[int], typing.List[bool], typing.List[str]]"
+    [["Ts_tuple", "typing.Tuple[bool, str]"]];
+  assert_add
+    ~left:"typing.Callable[[int, str, bool], None]"
+    ~right:"typing.Callable[[int, pyre_extensions.Unpack[Ts_tuple]], None]"
+    [["Ts_tuple", "typing.Tuple[str, bool]"]];
+  assert_add
+    ~left:"typing.Callable[[int, pyre_extensions.Unpack[Ts_tuple]], Ts_tuple]"
+    ~right:"typing.Callable[[int, str, bool], typing.Tuple[str, bool]]"
+    ~leave_unbound_in_left:["Ts_tuple"]
+    [[]];
+  ()
+
+
 let test_instantiate_protocol_parameters context =
   let assert_instantiate_protocol_parameters
       ?source
@@ -1280,6 +1402,7 @@ let () =
   >::: [
          "add_constraint" >:: test_add_constraint;
          "add_constraint_recursive_type" >:: test_add_constraint_recursive_type;
+         "add_constraint_type_variable_tuple" >:: test_add_constraint_type_variable_tuple;
          "instantiate_protocol_parameters" >:: test_instantiate_protocol_parameters;
          "marks_escaped_as_escaped" >:: test_mark_escaped_as_escaped;
        ]

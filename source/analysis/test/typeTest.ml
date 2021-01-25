@@ -484,6 +484,67 @@ let test_create _ =
           (Concatenation
              (create_concatenation ~mappers:["list"] (Type.Variable.Variadic.List.create "Ts")))));
 
+  (* Callable with unpacked tuples in positional parameters. *)
+  assert_create
+    ~aliases:(function
+      | "Ts" -> Some (TypeAlias (Type.Variable unary_variable))
+      | _ -> None)
+    "typing.Callable[[int, pyre_extensions.Unpack[Ts]], int]"
+    (Type.Callable
+       {
+         kind = Type.Callable.Anonymous;
+         implementation =
+           {
+             annotation = Type.integer;
+             parameters =
+               Defined
+                 [
+                   Parameter.Variable
+                     (Concrete
+                        (Type.TupleVariadic.create_unpacked_tuple
+                           [
+                             Type.integer;
+                             Type.parametric
+                               "pyre_extensions.Unpack"
+                               [Single (Type.Variable unary_variable)];
+                           ]));
+                 ];
+           };
+         overloads = [];
+       });
+  (* This one is not a top-level unpacked annotation. So, it is treated as a regular positional
+     parameter. *)
+  assert_create
+    ~aliases:(function
+      | "Ts" -> Some (TypeAlias (Type.Variable unary_variable))
+      | _ -> None)
+    "typing.Callable[[int, typing.Tuple[str, pyre_extensions.Unpack[Ts]]], int]"
+    (Type.Callable
+       {
+         kind = Type.Callable.Anonymous;
+         implementation =
+           {
+             annotation = Type.integer;
+             parameters =
+               Defined
+                 [
+                   Parameter.PositionalOnly { index = 0; annotation = Type.integer; default = false };
+                   Parameter.PositionalOnly
+                     {
+                       index = 1;
+                       annotation =
+                         Type.tuple
+                           [
+                             Type.string;
+                             Type.TupleVariadic.create_unpacked_tuple [Type.Variable unary_variable];
+                           ];
+                       default = false;
+                     };
+                 ];
+           };
+         overloads = [];
+       });
+
   assert_create "typing_extensions.Literal['foo']" (Type.literal_string "foo");
   assert_create "typing_extensions.Literal[u'foo']" (Type.literal_string "foo");
   assert_create "typing_extensions.Literal[b'foo']" (Type.literal_bytes "foo");
@@ -506,6 +567,18 @@ let test_create _ =
   assert_create "typing_extensions.Literal[ONE]" Type.Top;
   assert_create "typing_extensions.Literal[None]" Type.none;
   assert_create "_NotImplementedType" Type.Any;
+
+  (* TypeVar tuples. *)
+  let unary_variable = Type.Variable.Unary.create "Ts" in
+  assert_create
+    ~aliases:(function
+      | "Ts" -> Some (TypeAlias (Type.Variable unary_variable))
+      | _ -> None)
+    "pyre_extensions.Unpack[Ts]"
+    (Type.parametric "pyre_extensions.Unpack" [Single (Type.Variable unary_variable)]);
+  assert_create
+    "pyre_extensions.Unpack[typing.Tuple[int, str]]"
+    (Type.parametric "pyre_extensions.Unpack" [Single (Type.tuple [Type.integer; Type.string])]);
   ()
 
 

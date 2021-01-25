@@ -1403,6 +1403,15 @@ let typeshed_stubs ?(include_helper_builtins = true) () =
         _Ts = ListVariadic("_Ts")
         class Length(Generic[_Ts], int): pass
         class Product(Generic[_Ts], int): pass
+
+        class Unpack(Generic[_T]): ...
+        class Map(Generic[_T, _T2]): ...
+        class ExpectsVariableParameters: ...
+
+        _Ts = TypeVar("_Ts")
+        # We currently use `ExpectsVariableParameters` to denote that a class is to be treated as a variadic.
+        # In the future, this will just be `Generic[*Ts]`.
+        class Tensor(Generic[_Ts], pyre_extensions.ExpectsVariableParameters): ...
         |}
     );
     ( "pyre_extensions/type_variable_operators.pyi",

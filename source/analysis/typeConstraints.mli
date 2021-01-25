@@ -52,6 +52,13 @@ module type OrderedConstraintsType = sig
 
   val add_upper_bound : t -> order:order -> pair:Type.Variable.pair -> t option
 
+  val add_variadic_tuple_constraint
+    :  t ->
+    order:order ->
+    left_elements:Type.t list ->
+    right_elements:Type.t list ->
+    t option
+
   val add_fallback_to_any : t -> Type.Variable.t -> t
 
   val solve : t -> order:order -> Solution.t option

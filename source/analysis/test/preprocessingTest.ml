@@ -5111,6 +5111,71 @@ let test_six_metaclass_decorator _ =
   ()
 
 
+let test_expand_starred_type_variable_tuples _ =
+  let assert_expand ?(handle = "test.py") source expected =
+    let expected = parse ~handle ~coerce_special_methods:true expected in
+    let actual = parse ~handle source |> Preprocessing.expand_starred_type_variable_tuple in
+    assert_source_equal ~location_insensitive:true expected actual
+  in
+  assert_expand
+    {|
+    def foo(*args: *Ts) -> Ts: ...
+  |}
+    {|
+    def foo(*args: pyre_extensions.Unpack[Ts]) -> Ts: ...
+  |};
+  assert_expand
+    {|
+    class Tensor(Generic[*Ts]): ...
+  |}
+    {|
+    class Tensor(Generic[pyre_extensions.Unpack[Ts]]): ...
+  |};
+  assert_expand
+    {|
+    def foo(*args: *Ts) -> Tensor[int, *Ts]: ...
+  |}
+    {|
+    def foo(*args: pyre_extensions.Unpack[Ts]) -> Tensor[int, pyre_extensions.Unpack[Ts]]: ...
+  |};
+  assert_expand
+    {|
+    def foo() -> Tuple[int, *Tuple[str, bool]]: ...
+  |}
+    {|
+    def foo() -> Tuple[int, pyre_extensions.Unpack[Tuple[str, bool]]]: ...
+  |};
+  assert_expand
+    {|
+    def foo() -> Tuple[int, *Tuple[*Ts, *Ts]]: ...
+  |}
+    {|
+    def foo() -> Tuple[int, pyre_extensions.Unpack[Tuple[pyre_extensions.Unpack[Ts], pyre_extensions.Unpack[Ts]]]]: ...
+  |};
+  assert_expand
+    {|
+    def foo() -> Tuple[int, *Tuple[*Ts, *Ts]]: ...
+  |}
+    {|
+    def foo() -> Tuple[int, pyre_extensions.Unpack[Tuple[pyre_extensions.Unpack[Ts], pyre_extensions.Unpack[Ts]]]]: ...
+  |};
+  assert_expand
+    {|
+    f: typing.Callable[[typing.Tuple[*Ts, *Ts2]], bool]
+  |}
+    {|
+    f: typing.Callable[[typing.Tuple[pyre_extensions.Unpack[Ts], pyre_extensions.Unpack[Ts2]]], bool]
+  |};
+  assert_expand
+    {|
+    f: typing.Callable[[int, *Ts, *Ts2], bool]
+  |}
+    {|
+    f: typing.Callable[[int, pyre_extensions.Unpack[Ts], pyre_extensions.Unpack[Ts2]], bool]
+  |};
+  ()
+
+
 let () =
   "preprocessing"
   >::: [
@@ -5136,5 +5201,6 @@ let () =
          "unbound_names" >:: test_populate_unbound_names;
          "union_shorthand" >:: test_union_shorthand;
          "six_metaclass_decorator" >:: test_six_metaclass_decorator;
+         "expand_starred_type_variable_tuples" >:: test_expand_starred_type_variable_tuples;
        ]
   |> Test.run

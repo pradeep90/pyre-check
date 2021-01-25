@@ -951,6 +951,27 @@ class base class_metadata_environment dependency =
             | Type.Parametric { name = "typing.Generic"; _ } ->
                 annotation, sofar
             | Type.Parametric { name; parameters } ->
+                let expects_variable_parameters =
+                  ClassMetadataEnvironment.ReadOnly.successors
+                    class_metadata_environment
+                    ?dependency
+                    name
+                  |> fun successors ->
+                  List.mem
+                    ~equal:Identifier.equal
+                    successors
+                    "pyre_extensions.ExpectsVariableParameters"
+                in
+                let parameters =
+                  match expects_variable_parameters, Type.Parameter.all_singles parameters with
+                  | _, Some [Type.Parametric { name = "pyre_extensions.Unpack"; _ }] -> parameters
+                  | true, Some given ->
+                      [
+                        Type.Parameter.Single
+                          (Type.parametric "pyre_extensions.Unpack" [Single (Type.tuple given)]);
+                      ]
+                  | _ -> parameters
+                in
                 invalid_type_parameters ~name ~given:parameters
             | Type.IntExpression _ ->
                 let invalid_generic_int given =
@@ -3220,6 +3241,50 @@ class base class_metadata_environment dependency =
             extract arguments >>= concatenate >>= solve |> make_signature_match
           in
           match key, data with
+          | ( Parameter.Variable
+                (Concrete
+                  (Type.Parametric
+                    { name = "pyre_extensions.Unpack"; parameters = [Single expected] })),
+              arguments ) -> (
+              let { constraints_set; _ } = signature_match in
+              let argument_annotations =
+                List.map
+                  ~f:(function
+                    | Argument { resolved; _ } -> Some resolved
+                    | Default -> failwith "Variable parameters do not have defaults")
+                  arguments
+                |> Option.all
+                >>| List.rev
+              in
+              match argument_annotations with
+              | Some argument_annotations ->
+                  let actual = Type.tuple argument_annotations in
+                  let updated_constraints_set =
+                    TypeOrder.OrderedConstraintsSet.add
+                      constraints_set
+                      ~new_constraint:(LessOrEqual { left = actual; right = expected })
+                      ~order
+                  in
+                  if ConstraintsSet.potentially_satisfiable updated_constraints_set then
+                    { signature_match with constraints_set = updated_constraints_set }
+                  else
+                    {
+                      signature_match with
+                      reasons =
+                        {
+                          reasons with
+                          annotation =
+                            MismatchWithListVariadicTypeVariable
+                              {
+                                variable = Type.OrderedTypes.Concrete [expected];
+                                mismatch = ConstraintFailure (Type.OrderedTypes.Concrete [actual]);
+                              }
+                            :: signature_match.reasons.annotation;
+                        };
+                    }
+              | None ->
+                  Log.dump "Found some default arguments for `*args`. Not adding any constraints.";
+                  signature_match )
           | Parameter.Variable (Concatenation concatenation), arguments ->
               bind_arguments_to_variadic
                 ~expected:(Type.OrderedTypes.Concatenation concatenation)
