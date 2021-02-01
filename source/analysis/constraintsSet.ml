@@ -681,6 +681,17 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
           ~mapper_name
           ~mapped_annotation
           ~is_map_upper_bound:false
+    | ( Type.Parametric
+          {
+            name = "pyre_extensions.Unpack";
+            parameters = [Single (Type.Tuple (Unbounded Type.Any))];
+          },
+        Type.Parametric
+          {
+            name = "pyre_extensions.Unpack";
+            parameters = [Single (Type.Tuple (Bounded (Concrete _)))];
+          } ) ->
+        [constraints]
     | _, Type.Parametric { name = right_name; parameters = right_parameters } ->
         let solve_parameters left_parameters =
           let handle_variables constraints (left, right, variable) =
@@ -787,6 +798,13 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
         solve_concrete_tuples order ~left_annotations ~right_annotations ~constraints
     | Type.Tuple (Type.Bounded left), Type.Tuple (Type.Bounded right) ->
         solve_ordered_types_less_or_equal order ~left ~right ~constraints
+    | Type.Tuple (Type.Unbounded _), Type.Tuple (Type.Bounded (Concrete right_annotations))
+      when List.exists right_annotations ~f:Type.TupleVariadic.is_unpacked_tuple ->
+        solve_concrete_tuples
+          order
+          ~left_annotations:[Type.TupleVariadic.create_unpacked_tuple [left]]
+          ~right_annotations
+          ~constraints
     | Type.Tuple (Type.Unbounded parameter), Type.Primitive _ ->
         solve_less_or_equal
           order
@@ -1018,17 +1036,20 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
 
 
   and solve_concrete_tuples order ~left_annotations ~right_annotations ~constraints =
-    let is_expanded_variable index = function
+    let is_expanded_variadic index = function
       | Type.Parametric
           { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Variable variable)] } ->
-          Some (index, variable, Type.Variable.Unary.is_free variable)
+          Some (index, Some variable, Type.Variable.Unary.is_free variable)
+      | Type.Parametric
+          { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Tuple (Unbounded _))] } ->
+          Some (index, None, false)
       | _ -> None
     in
     match
-      ( List.filter_mapi ~f:is_expanded_variable left_annotations,
-        List.filter_mapi ~f:is_expanded_variable right_annotations )
+      ( List.filter_mapi ~f:is_expanded_variadic left_annotations,
+        List.filter_mapi ~f:is_expanded_variadic right_annotations )
     with
-    | [(free_variable_index, free_variable, true)], bound_variables
+    | [(free_variable_index, Some free_variable, true)], bound_variables
       when List.for_all bound_variables ~f:(fun (_, _, is_free) -> not is_free) ->
         let non_variadic_prefix_length = free_variable_index in
         let non_variadic_suffix_length = List.length left_annotations - free_variable_index - 1 in
@@ -1073,6 +1094,9 @@ module Make (OrderedConstraints : OrderedConstraintsType) = struct
           ~left_elements:left_annotations
           ~right_elements:right_annotations
         |> Option.to_list
+    | (_ :: _ as bound_variables), []
+      when List.for_all bound_variables ~f:(fun (_, _, is_free) -> not is_free) ->
+        impossible
     | _ ->
         solve_ordered_types_less_or_equal
           order

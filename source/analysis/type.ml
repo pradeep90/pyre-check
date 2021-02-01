@@ -2128,9 +2128,9 @@ let is_variable = function
 let contains_variable = exists ~predicate:is_variable
 
 module TupleVariadic = struct
-  let normalize_variadics =
+  let normalize_variadics annotation =
     let open Core in
-    instantiate ~constraints:(function
+    instantiate annotation ~constraints:(function
         | Parametric
             {
               name = "pyre_extensions.Map";
@@ -2154,10 +2154,15 @@ module TupleVariadic = struct
                   Parametric
                     {
                       name = "pyre_extensions.Unpack";
-                      parameters = [Single (Tuple (Bounded (Concrete [(Variable _ as variable)])))];
+                      parameters =
+                        [
+                          Single
+                            ( Tuple (Bounded (Concrete [(Variable _ as inner)]))
+                            | (Tuple (Unbounded _) as inner) );
+                        ];
                     };
                 ])) ->
-            Some variable
+            Some inner
         | Tuple (Bounded (Concrete annotations)) ->
             let unpack_expand = function
               | Parametric
@@ -2174,8 +2179,23 @@ module TupleVariadic = struct
 
   let create_unpacked_tuple = function
     | [(Variable _ as variable)] -> parametric "pyre_extensions.Unpack" [Single variable]
+    | [(Tuple (Unbounded _) as unbounded_tuple)] ->
+        parametric "pyre_extensions.Unpack" [Single unbounded_tuple]
     | elements ->
         parametric "pyre_extensions.Unpack" [Single (tuple elements)] |> normalize_variadics
+
+
+  let is_unpacked_tuple = function
+    | Parametric { name = "pyre_extensions.Unpack"; _ } -> true
+    | _ -> false
+
+
+  let is_unpacked_free_variadic = function
+    | Parametric
+        { name = "pyre_extensions.Unpack"; parameters = [Single (Variable { state = Free _; _ })] }
+      ->
+        true
+    | _ -> false
 end
 
 let contains_callable annotation = exists annotation ~predicate:is_callable

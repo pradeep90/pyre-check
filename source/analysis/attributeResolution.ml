@@ -943,27 +943,37 @@ class base class_metadata_environment dependency =
                   in
                   annotation, mismatch :: sofar
             in
+            let expects_variable_parameters name =
+              ClassMetadataEnvironment.ReadOnly.successors
+                class_metadata_environment
+                ?dependency
+                name
+              |> fun successors ->
+              List.mem
+                ~equal:Identifier.equal
+                successors
+                "pyre_extensions.ExpectsVariableParameters"
+            in
             match annotation with
             | Type.Primitive ("typing.Final" | "typing_extensions.Final") -> annotation, sofar
+            | Type.Primitive name when expects_variable_parameters name ->
+                invalid_type_parameters
+                  ~name
+                  ~given:
+                    [
+                      Type.Parameter.Single
+                        (Type.parametric
+                           "pyre_extensions.Unpack"
+                           [Single (Type.Tuple (Unbounded Type.Any))]);
+                    ]
             | Type.Primitive name -> invalid_type_parameters ~name ~given:[]
             (* natural variadics *)
             | Type.Parametric { name = "typing.Protocol"; _ }
             | Type.Parametric { name = "typing.Generic"; _ } ->
                 annotation, sofar
             | Type.Parametric { name; parameters } ->
-                let expects_variable_parameters =
-                  ClassMetadataEnvironment.ReadOnly.successors
-                    class_metadata_environment
-                    ?dependency
-                    name
-                  |> fun successors ->
-                  List.mem
-                    ~equal:Identifier.equal
-                    successors
-                    "pyre_extensions.ExpectsVariableParameters"
-                in
                 let parameters =
-                  match expects_variable_parameters, Type.Parameter.all_singles parameters with
+                  match expects_variable_parameters name, Type.Parameter.all_singles parameters with
                   | _, Some [Type.Parametric { name = "pyre_extensions.Unpack"; _ }] -> parameters
                   | true, Some given ->
                       [

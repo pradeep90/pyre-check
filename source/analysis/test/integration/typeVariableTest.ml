@@ -4202,6 +4202,152 @@ let test_type_variable_tuples context =
        typing.Tuple[typing.Any, ...])]]` for 2nd positional only parameter to call `foo` but got \
        `Tuple[bool]`.";
     ];
+  (* Unbounded tuples. *)
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def foo(xs: Tuple[*Ts]) -> Tuple[*Ts]: ...
+
+      def baz() -> None:
+       	unbounded_tuple2: Tuple[*Tuple[int, ...]]
+       	z = foo(unbounded_tuple2)
+       	reveal_type(z)
+    |}
+    ["Revealed type [-1]: Revealed type for `z` is `typing.Tuple[int, ...]`."];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def foo(xs: Tuple[*Ts]) -> Tuple[*Ts]: ...
+
+      def baz() -> None:
+       	unbounded_tuple: Tuple[int, ...]
+       	z = foo(unbounded_tuple)
+       	reveal_type(z)
+    |}
+    ["Revealed type [-1]: Revealed type for `z` is `typing.Tuple[int, ...]`."];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def foo(xs: Tuple[*Tuple[int, ...], *Ts, *Tuple[int, ...]]) -> Tuple[*Ts]: ...
+
+      def baz() -> None:
+       	unbounded_tuple: Tuple[*Tuple[int, ...]]
+       	z = foo(unbounded_tuple)
+       	reveal_type(z)
+    |}
+    ["Revealed type [-1]: Revealed type for `z` is `typing.Tuple[int, ...]`."];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def foo(xs: Tuple[*Tuple[str, ...], *Ts]) -> Tuple[*Ts]: ...
+
+      def baz() -> None:
+       	unbounded_tuple: Tuple[*Tuple[int, ...]]
+       	foo(unbounded_tuple)
+    |}
+    [
+      "Incompatible parameter type [6]: Expected `Tuple[*typing.Tuple[str, ...], *Variable[Ts \
+       (bound to typing.Tuple[typing.Any, ...])]]` for 1st positional only parameter to call `foo` \
+       but got `typing.Tuple[int, ...]`.";
+    ];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      T = TypeVar("T")
+
+      def foo(xs: Tuple[T, *Tuple[str, ...]]) -> T: ...
+
+      def baz() -> None:
+       	some_tuple: Tuple[int, str, str]
+       	z = foo(some_tuple)
+       	reveal_type(z)
+    |}
+    ["Revealed type [-1]: Revealed type for `z` is `int`."];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      T = TypeVar("T")
+
+      def foo(xs: Tuple[T, *Tuple[str, ...]]) -> T: ...
+
+      def baz() -> None:
+       	some_tuple: Tuple[int, str, int]
+       	foo(some_tuple)
+    |}
+    [
+      "Incompatible parameter type [6]: Expected `Tuple[Variable[T], *typing.Tuple[str, ...]]` for \
+       1st positional only parameter to call `foo` but got `Tuple[int, str, int]`.";
+    ];
+  (* `Tensor` without type parameters. *)
+  assert_type_errors
+    {|
+      from typing import TypeVar
+      from pyre_extensions import Tensor
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def bar() -> None:
+        x: Tensor
+        reveal_type(x)
+    |}
+    ["Revealed type [-1]: Revealed type for `x` is `Tensor[*typing.Tuple[typing.Any, ...]]`."];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+      from pyre_extensions import Tensor
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def expects_arbitrary_tensor(x: Tensor) -> Tensor: ...
+
+      def bar() -> None:
+        tensor: Tensor[int, str]
+        y = expects_arbitrary_tensor(tensor)
+        reveal_type(y)
+    |}
+    ["Revealed type [-1]: Revealed type for `y` is `Tensor[*typing.Tuple[typing.Any, ...]]`."];
+  assert_type_errors
+    {|
+      from typing import Tuple, TypeVar
+      from pyre_extensions import Tensor
+
+      # pyre-ignore[24]: `tuple` needs parameters.
+      Ts = TypeVar("Ts", bound=tuple)
+
+      def expects_concrete_tensor(x: Tensor[int, str]) -> Tensor[int, str]: ...
+
+      def bar() -> None:
+        unbounded_tensor: Tensor
+        y = expects_concrete_tensor(unbounded_tensor)
+        reveal_type(y)
+    |}
+    ["Revealed type [-1]: Revealed type for `y` is `Tensor[*Tuple[int, str]]`."];
   ()
 
 

@@ -436,7 +436,13 @@ end
 val exists : t -> predicate:(t -> bool) -> bool
 
 module TupleVariadic : sig
+  val normalize_variadics : type_t -> type_t
+
   val create_unpacked_tuple : type_t list -> type_t
+
+  val is_unpacked_tuple : type_t -> bool
+
+  val is_unpacked_free_variadic : type_t -> bool
 end
 
 module Callable : sig

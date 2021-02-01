@@ -2920,6 +2920,17 @@ let test_resolve_class _ =
   ()
 
 
+let test_normalize_tuple_variadics _ =
+  let assert_normalized annotation expected =
+    assert_equal ~printer:Type.show expected (Type.TupleVariadic.normalize_variadics annotation)
+  in
+  assert_normalized
+    (Type.tuple
+       [Type.parametric "pyre_extensions.Unpack" [Single (Type.Tuple (Unbounded Type.integer))]])
+    (Type.Tuple (Unbounded Type.integer));
+  ()
+
+
 let () =
   "type"
   >::: [
@@ -2984,6 +2995,7 @@ let () =
          "subtract_polynomials_with_variadics" >:: test_subtract_polynomials_with_variadics;
          "multiply_polynomials_with_variadics" >:: test_multiply_polynomials_with_variadics;
          "resolve_class" >:: test_resolve_class;
+         "normalize_tuple_variadics" >:: test_normalize_tuple_variadics;
        ]
   |> Test.run;
   "primitive" >::: ["is unit test" >:: test_is_unit_test] |> Test.run;

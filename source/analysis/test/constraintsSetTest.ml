@@ -1120,6 +1120,62 @@ let test_add_constraint_type_variable_tuple context =
     ~right:"typing.Callable[[int, str, bool], typing.Tuple[str, bool]]"
     ~leave_unbound_in_left:["Ts_tuple"]
     [[]];
+  assert_add
+  (* The postprocessing would turn the expected `Tuple[*Tuple[int, ...]]` into `Tuple[int, ...]`.
+     However, the function returns the former, which would lead to a type error. So, we nullify the
+     postprocessing here. *)
+    ~postprocess:Fn.id
+    ~left:"typing.Tuple[int, ...]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple]]"
+    [["Ts_tuple", "typing.Tuple[pyre_extensions.Unpack[typing.Tuple[int, ...]]]"]];
+  assert_add ~left:"typing.Tuple[int, ...]" ~right:"typing.Tuple[T]" [];
+  assert_add
+    ~left:"typing.Tuple[int, pyre_extensions.Unpack[Tuple[int, ...]]]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple]]"
+    [
+      [
+        ( "Ts_tuple",
+          "typing.Tuple[pyre_extensions.Unpack[typing.Tuple[int, pyre_extensions.Unpack[Tuple[int, \
+           ...]]]]]" );
+      ];
+    ];
+  assert_add
+    ~left:
+      "typing.Tuple[pyre_extensions.Unpack[Tuple[int, ...]], pyre_extensions.Unpack[Tuple[int, \
+       ...]]]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple]]"
+    [
+      [
+        ( "Ts_tuple",
+          "typing.Tuple[pyre_extensions.Unpack[Tuple[int, ...]], pyre_extensions.Unpack[Tuple[int, \
+           ...]]]" );
+      ];
+    ];
+  assert_add
+    ~left:"typing.Tuple[int, ...]"
+    ~right:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple]]"
+    [];
+  assert_add
+    ~left:"typing.Tuple[int, ...]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple], int]"
+    [];
+  assert_add ~left:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple]]" ~right:"typing.Tuple[T]" [];
+  assert_add
+    ~left:"typing.Tuple[int, pyre_extensions.Unpack[Ts_tuple2]]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple], T]"
+    [];
+  assert_add
+    ~left:"typing.Tuple[int, pyre_extensions.Unpack[typing.Tuple[int, ...]]]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple], T]"
+    [];
+  assert_add
+    ~left:"typing.Tuple[int, ...]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple], pyre_extensions.Unpack[Ts_tuple2]]"
+    [["Ts_tuple", "typing.Tuple[int, ...]"; "Ts_tuple2", "typing.Tuple[int, ...]"]];
+  assert_add
+    ~left:"typing.Tuple[int, ...]"
+    ~right:"typing.Tuple[pyre_extensions.Unpack[Ts_tuple], int, pyre_extensions.Unpack[Ts_tuple2]]"
+    [];
   ()
 
 

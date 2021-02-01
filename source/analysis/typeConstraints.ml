@@ -739,6 +739,13 @@ module OrderedConstraints (Order : OrderType) = struct
   module VariadicTupleConstraints = struct
     include Record.VariadicTupleConstraints
 
+    type variadic_length =
+      | KnownLength of int
+      | SameLengthAsBoundVariadic of Type.t Type.Variable.Unary.record
+    [@@deriving compare, show]
+
+    let _ = ([%show: variadic_length], [%compare: variadic_length]) |> ignore
+
     let instantiate variadic_tuple_constraints ~solution =
       let instantiate_variadic_constraint_pair { left_elements; right_elements } =
         {
@@ -752,19 +759,33 @@ module OrderedConstraints (Order : OrderType) = struct
     let known_length_for ~unaries annotation =
       match annotation with
       | Type.Parametric
-          { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Variable variable)] }
-        when Type.Variable.Unary.is_free variable ->
+          { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Variable variable)] } ->
           let tuple_type_length annotation =
             match annotation with
             | Type.Tuple (Bounded (Concrete annotations))
-              when List.is_empty (Type.Variable.all_free_variables annotation) ->
-                Some (List.length annotations)
+              when not (List.exists annotations ~f:Type.TupleVariadic.is_unpacked_tuple) ->
+                Some (KnownLength (List.length annotations))
+            | Type.Tuple
+                (Bounded
+                  (Concrete
+                    [
+                      Type.Parametric
+                        {
+                          name = "pyre_extensions.Unpack";
+                          parameters = [Single (Type.Variable bound_variadic)];
+                        };
+                    ])) ->
+                Some (SameLengthAsBoundVariadic bound_variadic)
             | _ -> None
           in
           UnaryVariable.Map.find unaries variable
           >>= fun { lower_bound; upper_bound } ->
           Option.first_some (tuple_type_length lower_bound) (tuple_type_length upper_bound)
-      | _ -> Some 1
+          >>= Option.some_if (Type.Variable.Unary.is_free variable)
+      | Type.Parametric
+          { name = "pyre_extensions.Unpack"; parameters = [Single (Type.Tuple (Unbounded _))] } ->
+          None
+      | _ -> Some (KnownLength 1)
 
 
     let strip_elements_of_known_length
@@ -782,25 +803,61 @@ module OrderedConstraints (Order : OrderType) = struct
           List.exists right_elements ~f:has_free_variable )
       with
       | false, true ->
-          let pair_with_matching_left_elements (pairs, left_elements, should_continue) right_element
+          let left_elements_with_lengths, right_elements_with_lengths =
+            ( List.map left_elements ~f:(fun element -> element, known_length_for ~unaries element),
+              List.map right_elements ~f:(fun element -> element, known_length_for ~unaries element)
+            )
+          in
+          let pair_with_matching_left_elements
+              (pairs, left_elements, should_continue)
+              (right_element, right_element_length)
             =
-            match known_length_for ~unaries right_element with
-            | Some length when should_continue ->
-                let left_prefix, left_rest = List.split_n left_elements length in
-                if List.length left_prefix = length then
-                  (Some left_prefix, right_element) :: pairs, left_rest, true
-                else
-                  (None, right_element) :: pairs, left_rest, false
+            let split ~required_length elements_with_length =
+              let length_sofar = ref 0 in
+              let prefix =
+                List.take_while elements_with_length ~f:(fun (_, length) ->
+                    match length with
+                    | Some (KnownLength length) ->
+                        let new_length = !length_sofar + length in
+                        if new_length <= required_length then (
+                          length_sofar := new_length;
+                          true )
+                        else
+                          false
+                    | _ -> false)
+              in
+              (List.map prefix ~f:fst, List.drop elements_with_length (List.length prefix))
+              |> Option.some_if (!length_sofar = required_length)
+            in
+            match right_element_length with
+            | Some (KnownLength required_length) when should_continue -> (
+                match split ~required_length left_elements with
+                | Some (left_prefix, left_rest) ->
+                    (Some left_prefix, right_element) :: pairs, left_rest, true
+                | _ -> (None, right_element) :: pairs, left_elements, false )
+            | Some (SameLengthAsBoundVariadic bound_variadic) when should_continue -> (
+                match left_elements with
+                | ( Type.Parametric
+                      {
+                        name = "pyre_extensions.Unpack";
+                        parameters = [Single (Type.Variable variable)];
+                      },
+                    _ )
+                  :: left_rest
+                  when Type.Variable.Unary.equal variable bound_variadic ->
+                    (Some [Type.Variable variable], right_element) :: pairs, left_rest, true
+                    (* TODO(pradeep): None and should_continue=false convey the same message. *)
+                | _ -> (None, right_element) :: pairs, left_elements, false )
             | _ -> pairs, left_elements, false
           in
           let pairs_for_right_prefix, remaining_left_elements, _ =
             List.fold
-              right_elements
-              ~init:([], left_elements, true)
+              right_elements_with_lengths
+              ~init:([], left_elements_with_lengths, true)
               ~f:pair_with_matching_left_elements
           in
           let remaining_right_elements =
-            List.drop right_elements (List.length pairs_for_right_prefix)
+            List.drop right_elements_with_lengths (List.length pairs_for_right_prefix)
           in
           let pairs_for_right_suffix, remaining_left_elements, _ =
             List.fold
@@ -808,11 +865,13 @@ module OrderedConstraints (Order : OrderType) = struct
               ~init:([], List.rev remaining_left_elements, true)
               ~f:pair_with_matching_left_elements
           in
-          let left_middle_portion = List.rev remaining_left_elements in
+          let left_middle_portion = List.rev remaining_left_elements |> List.map ~f:fst in
           let right_middle_portion =
             List.take
               remaining_right_elements
               (List.length remaining_right_elements - List.length pairs_for_right_suffix)
+            (* TODO(pradeep): Should this be reversed? *)
+            |> List.map ~f:fst
           in
           let add_bound_for_pair unaries (left_elements, right) =
             unaries
@@ -867,6 +926,53 @@ module OrderedConstraints (Order : OrderType) = struct
                   ~bound:(Type.tuple left_elements)
                   ~is_lower_bound:true
                   unaries
+                >>| fun unaries -> { constraints with unaries }, None
+            | ( _,
+                [
+                  Type.Parametric
+                    {
+                      name = "pyre_extensions.Unpack";
+                      parameters = [Single (Type.Tuple (Unbounded _) as unbounded_tuple)];
+                    };
+                ] ) ->
+                Option.some_if
+                  (Order.always_less_or_equal
+                     order
+                     ~left:(Type.tuple left_elements)
+                     ~right:unbounded_tuple)
+                  ({ constraints with unaries }, None)
+            | ( [
+                  Type.Parametric
+                    {
+                      name = "pyre_extensions.Unpack";
+                      parameters = [Single (Type.Tuple (Unbounded _) as unbounded_tuple)];
+                    };
+                ],
+                _ ) ->
+                List.fold right_elements ~init:(Some unaries) ~f:(fun unaries element ->
+                    match unaries, element with
+                    | ( Some unaries,
+                        Type.Parametric
+                          {
+                            name = "pyre_extensions.Unpack";
+                            parameters = [Single (Type.Variable variable)];
+                          } ) ->
+                        UnaryIntervalContainer.add_bound
+                          ~order
+                          ~variable
+                          ~bound:unbounded_tuple
+                          ~is_lower_bound:true
+                          unaries
+                    | ( Some unaries,
+                        Type.Parametric
+                          {
+                            name = "pyre_extensions.Unpack";
+                            parameters = [Single (Type.Tuple (Unbounded _) as right)];
+                          } ) ->
+                        Option.some_if
+                          (Order.always_less_or_equal order ~left:unbounded_tuple ~right)
+                          unaries
+                    | _ -> None)
                 >>| fun unaries -> { constraints with unaries }, None
             | _ ->
                 Some
